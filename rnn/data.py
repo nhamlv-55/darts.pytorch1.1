@@ -24,6 +24,49 @@ class Dictionary(object):
         return len(self.idx2word)
 
 
+class AutoNLUCorpus(object):
+    def __init__(self, path):
+        self.dictionary = Dictionary()
+        self.label = Dictionary()
+        self.train = self.tokenize(os.path.join(path, 'xaa'))
+        self.valid = self.tokenize(os.path.join(path, 'xaa'))
+        self.test = self.tokenize(os.path.join(path, 'xaa'))
+
+    def tokenize(self, path):
+        """Tokenizes a text file."""
+        assert os.path.exists(path)
+        # Add words to the dictionary
+        with open(path, 'r', encoding='utf-8') as f:
+            ntokens = 0
+            for line in f:
+                if line.strip()=="" or "-DOCSTART-" in line:
+                    continue
+                ntokens+=1
+                tokens = line.strip().split()
+                word = tokens[0]
+                label = tokens[-1]
+                self.dictionary.add_word(word)
+                self.label.add_word(label)
+
+        # Tokenize file content
+        with open(path, 'r', encoding='utf-8') as f:
+            word_ids = torch.LongTensor(ntokens)
+            label_ids = torch.LongTensor(ntokens)
+            idx = 0
+            for line in f:
+                if line.strip()=="" or "-DOCSTART-" in line:
+                    continue
+                tokens = line.strip().split()
+                word = tokens[0]
+                label = tokens[-1]
+                word_ids[idx] = self.dictionary.word2idx[word]
+                label_ids[idx] = self.label.word2idx[label]
+                idx+=1
+
+        return word_ids, label_ids
+
+
+
 class Corpus(object):
     def __init__(self, path):
         self.dictionary = Dictionary()
@@ -122,7 +165,9 @@ class BatchSentLoader(object):
         return self
 
 if __name__ == '__main__':
-    corpus = SentCorpus('../penn')
+    # corpus = SentCorpus('../penn')
+    corpus = AutoNLUCorpus('../data/conll-dataset')
+    print(len(corpus.dictionary), len(corpus.label))
     loader = BatchSentLoader(corpus.test, 10)
     for i, d in enumerate(loader):
         print(i, d.size())

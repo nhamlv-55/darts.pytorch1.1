@@ -49,7 +49,7 @@ class DARTSCell(nn.Module):
         for t in range(T):
             hidden = self.cell(inputs[t], hidden, x_mask, h_mask)
             hiddens.append(hidden)
-            hiddens = torch.stack(hiddens)
+        hiddens = torch.stack(hiddens)
         return hiddens, hiddens[-1].unsqueeze(0)
 
     def _compute_init_state(self, x, h_prev, x_mask, h_mask):
@@ -57,19 +57,19 @@ class DARTSCell(nn.Module):
             xh_prev = torch.cat([x * x_mask, h_prev * h_mask], dim=-1)
         else:
             xh_prev = torch.cat([x, h_prev], dim=-1)
-            c0, h0 = torch.split(xh_prev.mm(self._W0), self.nhid, dim=-1)
-            c0 = c0.sigmoid()
-            h0 = h0.tanh()
-            s0 = h_prev + c0 * (h0 - h_prev)
+        c0, h0 = torch.split(xh_prev.mm(self._W0), self.nhid, dim=-1)
+        c0 = c0.sigmoid()
+        h0 = h0.tanh()
+        s0 = h_prev + c0 * (h0 - h_prev)
         return s0
 
     def _get_activation(self, name):
         if name == 'tanh':
-            f = torch.tanh
+            f = F.tanh
         elif name == 'relu':
-            f = torch.relu
+            f = F.relu
         elif name == 'sigmoid':
-            f = torch.sigmoid
+            f = F.sigmoid
         elif name == 'identity':
             f = lambda x: x
         else:
@@ -86,22 +86,21 @@ class DARTSCell(nn.Module):
                 ch = (s_prev * h_mask).mm(self._Ws[i])
             else:
                 ch = s_prev.mm(self._Ws[i])
-                c, h = torch.split(ch, self.nhid, dim=-1)
-                c = c.sigmoid()
-                fn = self._get_activation(name)
-                h = fn(h)
-                s = s_prev + c * (h - s_prev)
-                states += [s]
-                output = torch.mean(
-                    torch.stack([states[i] for i in self.genotype.concat], -1),
-                    -1)
+            c, h = torch.split(ch, self.nhid, dim=-1)
+            c = c.sigmoid()
+            fn = self._get_activation(name)
+            h = fn(h)
+            s = s_prev + c * (h - s_prev)
+            states += [s]
+        output = torch.mean(
+            torch.stack([states[i] for i in self.genotype.concat], -1), -1)
         return output
-
 
 class RNNModel(nn.Module):
     """Container module with an encoder, a recurrent module, and a decoder."""
     def __init__(self,
                  ntoken,
+                 ntag,
                  ninp,
                  nhid,
                  nhidlast,
@@ -136,7 +135,24 @@ class RNNModel(nn.Module):
         self.dropouti = dropouti
         self.dropoute = dropoute
         self.ntoken = ntoken
+        self.ntag = ntag
         self.cell_cls = cell_cls
+
+        # # Maps the output of the RNN into tag space.
+        # self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
+
+        # # Matrix of transition parameters.  Entry i,j is the score of
+        # # transitioning *to* i *from* j.
+        # self.transitions = nn.Parameter(
+        #     torch.randn(self.tagset_size, self.tagset_size))
+
+        # # These two statements enforce the constraint that we never transfer
+        # # to the start tag and we never transfer from the stop tag
+        # self.transitions.data[tag_to_ix[START_TAG], :] = -10000
+        # self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
+
+        #to do tagging
+        self.ibo_classifier = nn.Linear(nhid, ntag)
 
     def init_weights(self):
         self.encoder.weight.data.uniform_(-INITRANGE, INITRANGE)
@@ -155,6 +171,7 @@ class RNNModel(nn.Module):
         new_hidden = []
         raw_outputs = []
         outputs = []
+        print("len rnns:", len(self.rnns))
         for l, rnn in enumerate(self.rnns):
             current_input = raw_output
             raw_output, new_h = rnn(raw_output, hidden[l])
@@ -170,18 +187,25 @@ class RNNModel(nn.Module):
         model_output = log_prob
         model_output = model_output.view(-1, batch_size, self.ntoken)
 
+        print(len(hidden), hidden[0].shape)
+        # ibo_logits = None
+        ibo_logits = self.ibo_classifier(output.view(-1, self.ninp))
+        ibo_log_prob = nn.functional.log_softmax(ibo_logits, dim=-1)
+        ibo_log_prob = ibo_log_prob.view(-1, batch_size, self.ntag)
+
+
         if return_h:
-            return model_output, hidden, raw_outputs, outputs
-        return model_output, hidden
+            return model_output, ibo_log_prob, hidden, raw_outputs, outputs
+        return model_output, ibo_log_prob, hidden
 
     def init_hidden(self, bsz):
         weight = next(self.parameters()).data
         return [weight.new(1, bsz, self.nhid).zero_()]
 
-class BiLSTM_CRF(nn.Module):
+class BiRNN_CRF(nn.Module):
 
     def __init__(self, vocab_size, tag_to_ix, embedding_dim, hidden_dim):
-        super(BiLSTM_CRF, self).__init__()
+        super(BiRNN_CRF, self).__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
@@ -189,10 +213,10 @@ class BiLSTM_CRF(nn.Module):
         self.tagset_size = len(tag_to_ix)
 
         self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
+        self.rnn = nn.RNN(embedding_dim, hidden_dim // 2,
                             num_layers=1, bidirectional=True)
 
-        # Maps the output of the LSTM into tag space.
+        # Maps the output of the RNN into tag space.
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
@@ -242,13 +266,13 @@ class BiLSTM_CRF(nn.Module):
         alpha = log_sum_exp(terminal_var)
         return alpha
 
-    def _get_lstm_features(self, sentence):
+    def _get_rnn_features(self, sentence):
         self.hidden = self.init_hidden()
         embeds = self.word_embeds(sentence).view(len(sentence), 1, -1)
-        lstm_out, self.hidden = self.lstm(embeds, self.hidden)
-        lstm_out = lstm_out.view(len(sentence), self.hidden_dim)
-        lstm_feats = self.hidden2tag(lstm_out)
-        return lstm_feats
+        rnn_out, self.hidden = self.rnn(embeds, self.hidden)
+        rnn_out = rnn_out.view(len(sentence), self.hidden_dim)
+        rnn_feats = self.hidden2tag(rnn_out)
+        return rnn_feats
 
     def _score_sentence(self, feats, tags):
         # Gives the score of a provided tag sequence
@@ -305,17 +329,17 @@ class BiLSTM_CRF(nn.Module):
         return path_score, best_path
 
     def neg_log_likelihood(self, sentence, tags):
-        feats = self._get_lstm_features(sentence)
+        feats = self._get_rnn_features(sentence)
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         return forward_score - gold_score
 
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
-        # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(sentence)
+        # Get the emission scores from the BiRNN
+        rnn_feats = self._get_rnn_features(sentence)
 
         # Find the best path, given the features.
-        score, tag_seq = self._viterbi_decode(lstm_feats)
+        score, tag_seq = self._viterbi_decode(rnn_feats)
         return score, tag_seq
 
 if __name__=="__main__":
@@ -341,7 +365,7 @@ if __name__=="__main__":
 
     tag_to_ix = {"B": 0, "I": 1, "O": 2, START_TAG: 3, STOP_TAG: 4}
 
-    model = BiLSTM_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM)
+    model = BiRNN_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM)
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
     # Check predictions before training
@@ -350,7 +374,7 @@ if __name__=="__main__":
         precheck_tags = torch.tensor([tag_to_ix[t] for t in training_data[0][1]], dtype=torch.long)
         print(model(precheck_sent))
 
-    # Make sure prepare_sequence from earlier in the LSTM section is loaded
+    # Make sure prepare_sequence from earlier in the RNN section is loaded
     for epoch in range(
             300):  # again, normally you would NOT do 300 epochs, it is toy data
         for sentence, tags in training_data:

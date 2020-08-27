@@ -67,8 +67,10 @@ class RNNModelSearch(RNNModel):
       return self._arch_parameters
 
     def _loss(self, hidden, input, target):
-      log_prob, hidden_next = self(input, hidden, return_h=False)
+      log_prob, ibo_logits, hidden_next = self(input, hidden, return_h=False)
       loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), target)
+      # ibo_loss = CrossEntropyLoss(ibo_logits.view(-1, self.ntag), target)
+      # loss+=ibo_loss
       return loss, hidden_next
 
     def genotype(self):

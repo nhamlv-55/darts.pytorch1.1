@@ -15,10 +15,10 @@ import gc
 import data
 import model_search as model
 
-from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint
+from utils import batchify, batchify_auto_nlu, get_batch, get_batch_auto_nlu, repackage_hidden, create_exp_dir, save_checkpoint
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank/WikiText2 Language Model')
-parser.add_argument('--data', type=str, default='../data/penn/',
+parser.add_argument('--data', type=str, default='../data/conll-dataset/',
                     help='location of the data corpus')
 parser.add_argument('--emsize', type=int, default=300,
                     help='size of word embeddings')
@@ -68,7 +68,7 @@ parser.add_argument('--small_batch_size', type=int, default=-1,
                      until batch_size is reached. An update step is then performed.')
 parser.add_argument('--max_seq_len_delta', type=int, default=20,
                     help='max sequence length')
-parser.add_argument('--gpu', type=str, default='0', help='GPU device to use')
+parser.add_argument('--gpu', type=str, default='0,1', help='GPU device to use')
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_wdecay', type=float, default=1e-3,
                     help='weight decay for the architecture encoding alpha')
@@ -106,22 +106,36 @@ torch.cuda.manual_seed_all(args.seed)
 logging.info('gpu device = %s' % args.gpu)
 logging.info("args = %s", args)
 
-corpus = data.Corpus(args.data)
+corpus = data.AutoNLUCorpus(args.data)
 
 eval_batch_size = 10
 test_batch_size = 1
 
-train_data = batchify(corpus.train, args.batch_size, args)
-search_data = batchify(corpus.valid, args.batch_size, args)
-val_data = batchify(corpus.valid, eval_batch_size, args)
-test_data = batchify(corpus.test, test_batch_size, args)
+train_data = batchify_auto_nlu(corpus.train, args.batch_size, args)
+logging.info("train_data {}, {}".format(train_data[0], train_data[1]))
+search_data = batchify_auto_nlu(corpus.valid, args.batch_size, args)
+val_data = batchify_auto_nlu(corpus.valid, eval_batch_size, args)
+test_data = batchify_auto_nlu(corpus.test, test_batch_size, args)
 
+tags = ["B-LOC",
+        "B-MISC",
+        "B-ORG",
+        "B-PER",
+        "I-LOC",
+        "I-MISC",
+        "I-ORG",
+        "I-PER",
+        "O"]
 
 ntokens = len(corpus.dictionary)
+ntags = len(corpus.label)
+
+logging.info("ntokens {} ntags {}".format(ntokens, ntags))
+
 if args.continue_train:
     model = torch.load(os.path.join(args.save, 'model.pt'))
 else:
-    model = model.RNNModelSearch(ntokens, args.emsize, args.nhid, args.nhidlast, 
+    model = model.RNNModelSearch(ntokens, ntags,  args.emsize, args.nhid, args.nhidlast, 
                        args.dropout, args.dropouth, args.dropoutx, args.dropouti, args.dropoute)
 
 size = 0
@@ -144,6 +158,22 @@ total_params = sum(x.data.nelement() for x in model.parameters())
 logging.info('Args: {}'.format(args))
 logging.info('Model total parameters: {}'.format(total_params))
 
+def evaluate_auto_nlu(data_source, batch_size=10):
+    # Turn on evaluation mode which disables dropout.
+    model.eval()
+    total_loss = 0
+    ntokens = len(corpus.dictionary)
+    hidden = model.init_hidden(batch_size)
+    with torch.no_grad():
+        for i in range(0, data_source[0].size(0) - 1, args.bptt):
+            data = get_batch_auto_nlu(data_source[0], i, args, evaluation=True)
+            targets = get_batch_auto_nlu(data_source[1], i, args, evaluation=True)
+            targets = targets.view(-1)
+            _, ibo_log_prob, hidden = parallel_model(data, hidden)
+            loss = nn.functional.nll_loss(ibo_log_prob.view(-1, ibo_log_prob.size(2)), targets).data
+            total_loss += loss * len(data)
+            hidden = repackage_hidden(hidden)
+    return total_loss.item() / len(data_source[0])
 
 def evaluate(data_source, batch_size=10):
     # Turn on evaluation mode which disables dropout.
@@ -155,7 +185,7 @@ def evaluate(data_source, batch_size=10):
         for i in range(0, data_source.size(0) - 1, args.bptt):
             data, targets = get_batch(data_source, i, args, evaluation=True)
             targets = targets.view(-1)
-            log_prob, hidden = parallel_model(data, hidden)
+            log_prob, ibo_log_prob, hidden = parallel_model(data, hidden)
             loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
             total_loss += loss * len(data)
             hidden = repackage_hidden(hidden)
@@ -172,7 +202,7 @@ def train():
     hidden = [model.init_hidden(args.small_batch_size) for _ in range(args.batch_size // args.small_batch_size)]
     hidden_valid = [model.init_hidden(args.small_batch_size) for _ in range(args.batch_size // args.small_batch_size)]
     batch, i = 0, 0
-    while i < train_data.size(0) - 1 - 1:
+    while i < train_data[0].size(0) - 1 - 1:
         bptt = args.bptt if np.random.random() < 0.95 else args.bptt / 2.
         # Prevent excessively small or negative sequence lengths
         # seq_len = max(5, int(np.random.normal(bptt, 5)))
@@ -184,14 +214,16 @@ def train():
         optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
         model.train()
 
-        data_valid, targets_valid = get_batch(search_data, i % (search_data.size(0) - 1), args)
-        data, targets = get_batch(train_data, i, args, seq_len=seq_len)
-
+        data_valid = get_batch_auto_nlu(search_data[0], i % (search_data[0].size(0) - 1), args)
+        targets_valid = get_batch_auto_nlu(search_data[1], i % (search_data[0].size(0) - 1), args)
+        data = get_batch_auto_nlu(train_data[0], i, args, seq_len=seq_len)
+        targets = get_batch_auto_nlu(train_data[1], i, args, seq_len=seq_len)
         optimizer.zero_grad()
 
         start, end, s_id = 0, args.small_batch_size, 0
         while start < args.batch_size:
-            cur_data, cur_targets = data[:, start: end], targets[:, start: end].contiguous().view(-1)
+            cur_data = data[:, start: end] 
+            cur_targets = targets[:, start: end].contiguous().view(-1)
             cur_data_valid, cur_targets_valid = data_valid[:, start: end], targets_valid[:, start: end].contiguous().view(-1)
 
             # Starting each batch, we detach the hidden state from how it was previously produced.
@@ -209,8 +241,12 @@ def train():
             optimizer.zero_grad()
             hidden[s_id] = repackage_hidden(hidden[s_id])
 
-            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(cur_data, hidden[s_id], return_h=True)
-            raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
+            log_prob, ibo_log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(cur_data, hidden[s_id], return_h=True)
+            # language modeling loss
+            # raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
+            # tagging loss
+            # raw_loss = ibo_loss_fct(ibo_log_prob.view(-1, ntags), ibo_targets.view(-1))
+            raw_loss = nn.functional.nll_loss(ibo_log_prob.view(-1, ibo_log_prob.size(2)), cur_targets).data
 
             loss = raw_loss
             # Activiation Regularization
@@ -267,7 +303,8 @@ for epoch in range(1, args.epochs+1):
     epoch_start_time = time.time()
     train()
 
-    val_loss = evaluate(val_data, eval_batch_size)
+    # val_loss = evaluate(val_data, eval_batch_size)
+    val_loss = evaluate_auto_nlu(val_data, eval_batch_size)
     logging.info('-' * 89)
     logging.info('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
             'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
@@ -280,3 +317,5 @@ for epoch in range(1, args.epochs+1):
         stored_loss = val_loss
 
     best_val_loss.append(val_loss)
+
+logging.info(parallel_model.genotype())

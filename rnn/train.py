@@ -18,7 +18,7 @@ import model
 from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank/WikiText2 Language Model')
-parser.add_argument('--data', type=str, default='../data/penn/',
+parser.add_argument('--data', type=str, default='../data/conll-dataset/',
                     help='location of the data corpus')
 parser.add_argument('--emsize', type=int, default=850,
                     help='size of word embeddings')
@@ -101,21 +101,20 @@ cudnn.benchmark = True
 cudnn.enabled=True
 torch.cuda.manual_seed_all(args.seed)
 
-corpus = data.Corpus(args.data)
+corpus = data.AutoNLUCorpus(args.data)
 
 eval_batch_size = 10
 test_batch_size = 1
-train_data = batchify(corpus.train, args.batch_size, args)
-val_data = batchify(corpus.valid, eval_batch_size, args)
-test_data = batchify(corpus.test, test_batch_size, args)
+train_data = batchify_auto_nlu(corpus.train, args.batch_size, args)
+val_data = batchify_auto_nlu(corpus.valid, eval_batch_size, args)
+test_data = batchify_auto_nlu(corpus.test, test_batch_size, args)
 
-
-ntokens = len(corpus.dictionary)
 if args.continue_train:
     model = torch.load(os.path.join(args.save, 'model.pt'))
 else:
     genotype = eval("genotypes.%s" % args.arch)
-    model = model.RNNModel(ntokens, args.emsize, args.nhid, args.nhidlast, 
+    print("Genotype:", genotype)
+    model = model.RNNModel(ntokens, ntags, args.emsize, args.nhid, args.nhidlast, 
                        args.dropout, args.dropouth, args.dropoutx, args.dropouti, args.dropoute, 
                        cell_cls=model.DARTSCell, genotype=genotype)
 
@@ -154,10 +153,9 @@ def train():
     # Turn on training mode which enables dropout.
     total_loss = 0
     start_time = time.time()
-    ntokens = len(corpus.dictionary)
     hidden = [model.init_hidden(args.small_batch_size) for _ in range(args.batch_size // args.small_batch_size)]
     batch, i = 0, 0
-    while i < train_data.size(0) - 1 - 1:
+    while i < train_data[0].size(0) - 1 - 1:
         bptt = args.bptt if np.random.random() < 0.95 else args.bptt / 2.
         # Prevent excessively small or negative sequence lengths
         seq_len = max(5, int(np.random.normal(bptt, 5)))
@@ -167,7 +165,8 @@ def train():
         lr2 = optimizer.param_groups[0]['lr']
         optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
         model.train()
-        data, targets = get_batch(train_data, i, args, seq_len=seq_len)
+        data = get_batch(train_data[0], i, args, seq_len=seq_len)
+        targets = get_batch(train_data[1], i, args, seq_len=seq_len)
 
         optimizer.zero_grad()
 
@@ -179,7 +178,7 @@ def train():
             # If we didn't, the model would try backpropagating all the way to start of the dataset.
             hidden[s_id] = repackage_hidden(hidden[s_id])
 
-            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(cur_data, hidden[s_id], return_h=True)
+            log_prob, iob_logits, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(cur_data, hidden[s_id], return_h=True)
             raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
 
             loss = raw_loss

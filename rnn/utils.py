@@ -3,6 +3,23 @@ import torch.nn as nn
 import os, shutil
 import numpy as np
 
+def argmax(vec):
+    # return the argmax as a python int
+    _, idx = torch.max(vec, 1)
+    return idx.item()
+
+
+def prepare_sequence(seq, to_ix):
+    idxs = [to_ix[w] for w in seq]
+    return torch.tensor(idxs, dtype=torch.long)
+
+
+# Compute log sum exp in a numerically stable way for the forward algorithm
+def log_sum_exp(vec):
+    max_score = vec[0, argmax(vec)]
+    max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
+    return max_score + \
+        torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
 
 def repackage_hidden(h):
     """Wraps hidden states in new Tensors, to detach them from their history."""
@@ -16,10 +33,14 @@ def batchify(data, bsz, args):
     nbatch = data.size(0) // bsz
     data = data.narrow(0, 0, nbatch * bsz)
     data = data.view(bsz, -1).t().contiguous()
-    print(data.size())
     data = data.cuda()
     return data
 
+def batchify_auto_nlu(data, bsz, args):
+    input_data = data[0]
+    label_data = data[1]
+
+    return batchify(input_data, bsz, args), batchify(label_data, bsz, args)
 
 def get_batch(source, i, args, seq_len=None, evaluation=False):
     seq_len = min(seq_len if seq_len else args.bptt, len(source) - 1 - i)
@@ -27,6 +48,10 @@ def get_batch(source, i, args, seq_len=None, evaluation=False):
     target = source[i+1:i+1+seq_len]
     return data, target
 
+def get_batch_auto_nlu(source, i, args, seq_len=None, evaluation=False):
+    seq_len = min(seq_len if seq_len else args.bptt, len(source) - 1 - i)
+    data = source[i:i+seq_len].detach() if evaluation else source[i:i+seq_len]
+    return data
 
 def create_exp_dir(path, scripts_to_save=None):
     if not os.path.exists(path):
